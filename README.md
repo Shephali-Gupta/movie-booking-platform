@@ -1,6 +1,6 @@
 # Movie Booking Platform — Scalable Distributed System Design
 
-This com.movie.booking.repository showcases the design and reference implementation of a **cloud-native, highly scalable movie ticket booking system** built to handle real-world production challenges like:
+This repository showcases the design and reference implementation of a **cloud-native, highly scalable movie ticket booking system** built to handle real-world production challenges like:
 
 * Massive traffic spikes during blockbuster releases
 * High read/write imbalance
@@ -24,6 +24,24 @@ This project prioritizes **engineering depth over UI**.
 
 ---
 
+## Implemented Scenarios
+
+The following scenarios are **implemented** in this codebase (single Spring Boot app + PostgreSQL). See [DESIGN.md](architecture/DESIGN.md) and [SequenceDiagram.md](architecture/SequenceDiagram.md) for flows and target evolution.
+
+| # | Scenario | API / Behaviour | Notes |
+|---|----------|-----------------|--------|
+| **1** | **Browse theatres and shows** | `GET /api/browse/theatres?movieId=&city=&date=` | Returns theatres running the movie in the given city on the given date, with show timings. Read-only; no locks. |
+| **2** | **List seats for a show** | `GET /api/browse/shows/{showId}/seats` | Returns all seats for the show with status (AVAILABLE / LOCKED / BOOKED). Used to pick seats before booking. |
+| **3** | **Book tickets (single or multi-seat)** | `POST /bookings` — body: `{ "userId", "showId", "seatNumbers": ["A1","A2","A3"] }` | Creates one `Booking` and N `BookingSeat` rows; applies **50% off 3rd ticket** and **20% afternoon show** discount; uses in-memory seat lock + `@Transactional` + `ShowSeat` version for concurrency. |
+| **4** | **Theatre show CRUD** | `POST /api/theatres/{theatreId}/shows`, `PUT .../shows/{showId}`, `DELETE .../shows/{showId}` | Create, update, delete shows. Screen must belong to the theatre (ownership validated). |
+| **5** | **Seat inventory (allocate & update)** | `POST /api/theatres/{theatreId}/shows/{showId}/seats` (allocate), `PATCH .../seats/{seatNumber}?status=` (update) | Allocate creates `show_seat` rows; update changes seat status (e.g. block/unblock). Theatre ownership verified. |
+| **6** | **Cancel booking** | `DELETE /bookings/{bookingId}` | Releases seats (status → AVAILABLE), marks booking as CANCELLED. Idempotent for already-cancelled. |
+| **7** | **Bulk cancel** | `POST /bookings/bulk-cancel` — body: `{ "bookingIds": [1,2,3] }` | Cancels multiple bookings; returns count of cancelled vs requested. |
+
+**Not yet implemented (target):** Distributed seat lock (Redis), Kafka event stream, payment saga, API idempotency keys, read replicas/cache.
+
+---
+
 ## Key Assumptions
 
 | Area            | Assumption                               |
@@ -35,6 +53,17 @@ This project prioritizes **engineering depth over UI**.
 | Search          | Slight staleness allowed for performance |
 | Failures        | Must never cause double booking          |
 | Scale           | Designed for horizontal scaling          |
+
+### Implementation-specific assumptions
+
+| Area | Assumption |
+|------|------------|
+| **Concurrency** | In-memory `SeatLockManager` (per seat key) — safe for **single instance** only; multi-node requires Redis/distributed lock. |
+| **Booking flow** | Booking is **synchronous**; no payment step in code. `total_amount` is computed with discounts and stored; booking status is CONFIRMED. |
+| **Discounts** | **50% off 3rd ticket** (when booking ≥3 seats); **20% off** for **afternoon shows** (12:00–17:00 in server default timezone). |
+| **Cancellation** | Any CONFIRMED booking can be cancelled; seats are released and status set to CANCELLED. Already-cancelled returns success (idempotent). |
+| **Data model** | Movie → Theatre → Screen → Show → ShowSeat → Booking / BookingSeat. PostgreSQL; schema in `database/schema.sql`. Tables `payment`, `idempotency_record`, `outbox_event` exist for future use. |
+| **Deployment** | Single monolithic Spring Boot app; `docker-compose` for DB (and optional services). |
 
 ---
 
@@ -61,7 +90,7 @@ Async Consumers:
 
 ### Prevent Double Booking Without DB Locks
 
-Instead of pessimistic DB com.movie.booking.locking (which kills scale), we use:
+Instead of pessimistic DB locking (which kills scale), we use:
 
 * Short-lived **distributed seat locks (Redis)**
 * **Optimistic versioning** at DB layer
@@ -77,7 +106,7 @@ Autoscaling driven by:
 
 * Kafka consumer lag
 * Partition parallelism
-* Stateless com.movie.booking.service replicas
+* Stateless service replicas
 
 This ensures scale reacts to **real workload pressure**.
 
